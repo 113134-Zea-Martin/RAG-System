@@ -45,44 +45,128 @@ class DocumentService:
             logger.error(f"Document with ID {request.document_id} not found for embedding generation")
             raise ValueError("Document not found")
 
-        # Chunking por oraciones
-        def sentence_splitter(text: str) -> List[str]:
+        # Chunking inteligente: combina oraciones hasta un máximo de caracteres
+        def smart_chunker(text: str, max_chars: int = 1000, overlap: int = 100) -> List[str]:
+            """
+            Divide el texto en chunks de tamaño máximo, respetando límites de oraciones.
+            Añade overlap entre chunks para mantener contexto.
+            """
             sentences = re.split(r'(?<=[.!?])\s+', text.strip())
-            return [s for s in sentences if s]
+            chunks = []
+            current_chunk = []
+            current_length = 0
+            
+            for sentence in sentences:
+                sentence_len = len(sentence)
+                
+                # Si una sola oración es muy larga, dividirla por palabras
+                if sentence_len > max_chars:
+                    if current_chunk:
+                        chunks.append(" ".join(current_chunk))
+                        current_chunk = []
+                        current_length = 0
+                    
+                    # Dividir oración larga por palabras
+                    words = sentence.split()
+                    temp_chunk = []
+                    temp_length = 0
+                    
+                    for word in words:
+                        word_len = len(word) + 1  # +1 por el espacio
+                        if temp_length + word_len > max_chars and temp_chunk:
+                            chunks.append(" ".join(temp_chunk))
+                            # Overlap: mantener últimas palabras
+                            overlap_words = int(len(temp_chunk) * 0.1)
+                            temp_chunk = temp_chunk[-overlap_words:] if overlap_words > 0 else []
+                            temp_length = sum(len(w) + 1 for w in temp_chunk)
+                        temp_chunk.append(word)
+                        temp_length += word_len
+                    
+                    if temp_chunk:
+                        chunks.append(" ".join(temp_chunk))
+                    continue
+                
+                # Agregar oración al chunk actual
+                if current_length + sentence_len > max_chars and current_chunk:
+                    chunks.append(" ".join(current_chunk))
+                    # Overlap: mantener última oración
+                    if current_chunk:
+                        overlap_text = current_chunk[-1]
+                        current_chunk = [overlap_text, sentence]
+                        current_length = len(overlap_text) + sentence_len + 1
+                    else:
+                        current_chunk = [sentence]
+                        current_length = sentence_len
+                else:
+                    current_chunk.append(sentence)
+                    current_length += sentence_len + 1
+            
+            # Agregar el último chunk
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+            
+            return [c for c in chunks if c.strip()]
         
-        pieces = sentence_splitter(document["content"])
-        if not pieces:
+        chunks_texts = smart_chunker(document["content"], max_chars=1000)
+        
+        if not chunks_texts:
             logger.error("No content to chunk for document %s", request.document_id)
             raise ValueError("Document has no content to embed")
+        
+        logger.info(f"Document {request.document_id} split into {len(chunks_texts)} chunks")
 
-        chunks = [{"text": p, "metadata": {"source": request.document_id, "chunk_index": i}} for i, p in enumerate(pieces)]
-
-        # Embedding con Cohere
+        # Embedding con Cohere - procesamiento por lotes
         co = self._get_cohere_client()
-
-        def embed_texts(texts: List[str]) -> List[List[float]]:
-            resp = co.embed(
-                texts=texts,
-                model="embed-multilingual-v3.0",
-                input_type="search_document",
-                embedding_types=["float"],
-            )
-            return resp.embeddings.float
-
-        texts = [c["text"] for c in chunks]
-        metadatas = [c["metadata"] for c in chunks]
-        ids = [f"{request.document_id}_chunk_{i}" for i in range(len(chunks))]
+        
+        def embed_texts_batch(texts: List[str], batch_size: int = 96) -> List[List[float]]:
+            """
+            Genera embeddings en lotes para evitar límites de la API.
+            Cohere permite hasta 96 textos por request.
+            """
+            all_embeddings = []
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                logger.debug(f"Processing embedding batch {i//batch_size + 1}/{(len(texts)-1)//batch_size + 1}")
+                try:
+                    resp = co.embed(
+                        texts=batch,
+                        model="embed-multilingual-v3.0",
+                        input_type="search_document",
+                        embedding_types=["float"],
+                    )
+                    all_embeddings.extend(resp.embeddings.float)
+                except Exception as e:
+                    logger.error(f"Error in batch {i//batch_size + 1}: {e}")
+                    raise
+            return all_embeddings
 
         try:
-            embeddings = embed_texts(texts)
+            embeddings = embed_texts_batch(chunks_texts, batch_size=96)
+            logger.info(f"Generated {len(embeddings)} embeddings for document {request.document_id}")
         except Exception as e:
             logger.exception("Error generating embeddings for document %s", request.document_id)
             raise
 
-        # Guardar en Chroma
+        # Preparar datos para Chroma
+        metadatas = [{"source": request.document_id, "chunk_index": i} for i in range(len(chunks_texts))]
+        ids = [f"{request.document_id}_chunk_{i}" for i in range(len(chunks_texts))]
+
+        # Guardar en Chroma en lotes
         try:
             collection = self._get_chroma_collection(name="documents")
-            collection.add(documents=texts, embeddings=embeddings, metadatas=metadatas, ids=ids)
+            
+            # Chroma también tiene límites, procesar en lotes
+            batch_size = 100
+            for i in range(0, len(chunks_texts), batch_size):
+                end_idx = min(i + batch_size, len(chunks_texts))
+                logger.debug(f"Saving to Chroma batch {i//batch_size + 1}/{(len(chunks_texts)-1)//batch_size + 1}")
+                collection.add(
+                    documents=chunks_texts[i:end_idx],
+                    embeddings=embeddings[i:end_idx],
+                    metadatas=metadatas[i:end_idx],
+                    ids=ids[i:end_idx]
+                )
+            logger.info(f"Saved {len(chunks_texts)} chunks to Chroma for document {request.document_id}")
         except Exception as e:
             logger.exception("Error saving embeddings to Chroma for document %s", request.document_id)
             raise
@@ -92,8 +176,8 @@ class DocumentService:
         except Exception:
             logger.debug("storage.create_embedding falló (no crítico) para %s", request.document_id)
 
-        logger.info(f"Embedding generated and stored for document ID: {request.document_id}")
-        return EmbeddingResponse(message="Embedding generated successfully")
+        logger.info(f"Embedding generated and stored for document ID: {request.document_id} ({len(chunks_texts)} chunks)")
+        return EmbeddingResponse(message=f"Embedding generated successfully ({len(chunks_texts)} chunks)")
 
     def search_documents(self, query: SearchQuery) -> SearchResponse:
         """
